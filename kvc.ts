@@ -80,6 +80,8 @@ interface CapturedRequest {
 let captured: CapturedRequest | null = null;
 /** Set by /kvc; consumed by the session_before_compact hook or expired. */
 let compatArmedUntil = 0;
+/** Set by `/kvc force`; skips the captured/current model-id check. */
+let compatForce = false;
 dbg(`module loaded (pid=${process.pid})`);
 
 const SUMMARIZER_SYSTEM_PREFIX = "You are a context summarization assistant";
@@ -222,6 +224,18 @@ function stripRepeatedSystemPrompt(summary: string, systemPrompt: string): strin
   if (i <= 100) return summary;
   const rest = s.slice(i).replace(/^\s+/, "");
   return rest.length > 40 ? rest : summary;
+}
+
+/**
+ * Model-id comparison tolerant of pi version differences: some pi versions
+ * prefix the provider into the payload `model` field ("lmstudio/foo" vs
+ * "foo"). Only a leading "<currentProvider>/" segment is tolerated, so ids
+ * that legitimately contain slashes ("qwen/qwen3.6-35b-a3b") are unaffected.
+ */
+function modelIdMatches(capturedId: string, currentId: string, provider?: string): boolean {
+  if (capturedId === currentId) return true;
+  if (provider && capturedId === `${provider}/${currentId}`) return true;
+  return false;
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -400,7 +414,9 @@ export default function (pi: ExtensionAPI) {
 
   // 2) Invalidate the capture when the base prompt can no longer match.
   pi.on("model_select", (event: ModelSelectEvent) => {
-    if (captured && event.model?.id !== captured.modelId) {
+    const newId = event.model?.id ? String(event.model.id) : "";
+    const newProvider = (event.model as any)?.provider != null ? String((event.model as any).provider) : undefined;
+    if (captured && !modelIdMatches(captured.modelId, newId, newProvider)) {
       dbg(`model_select ${event.model?.id} != captured ${captured.modelId} -> invalidate`);
       captured = null;
     }
@@ -418,9 +434,11 @@ export default function (pi: ExtensionAPI) {
 
   // 3) Take over only /kvc-triggered compactions.
   pi.on("session_before_compact", async (event, ctx) => {
-    dbg(`session_before_compact reason=${event.reason} armed=${Date.now() <= compatArmedUntil} captured=${Boolean(captured)}`);
+    dbg(`session_before_compact reason=${event.reason} armed=${Date.now() <= compatArmedUntil} captured=${Boolean(captured)} force=${compatForce}`);
     if (Date.now() > compatArmedUntil) return; // not armed: built-in /compact or auto-compaction -> untouched
     compatArmedUntil = 0;
+    const force = compatForce;
+    compatForce = false;
     if (event.reason !== "manual") return;
 
     const notify = (msg: string, kind: "info" | "warning" | "error" = "info") => {
@@ -441,9 +459,16 @@ export default function (pi: ExtensionAPI) {
       notify(`kvc: ${model.provider} is not OpenAI-compatible - using built-in compaction`, "warning");
       return;
     }
-    if (!captured || captured.modelId !== model.id) {
+    if (!captured) {
       notify("kvc: no cached request for the current model - using built-in compaction", "warning");
       return;
+    }
+    if (!modelIdMatches(captured.modelId, model.id, String(model.provider))) {
+      if (!force) {
+        notify(`kvc: model mismatch (captured="${captured.modelId}" current="${model.id}") - using built-in compaction`, "warning");
+        return;
+      }
+      notify(`kvc: forced - captured model "${captured.modelId}" != current "${model.id}"; prefix cache may miss`, "info");
     }
 
     try {
@@ -468,10 +493,17 @@ export default function (pi: ExtensionAPI) {
   // 4) The /kvc command itself.
   pi.registerCommand("kvc", {
     description:
-      "KV-cache-compatible compaction (like /compact, but the summary request reuses the server's KV cache - no full re-prefill on llama.cpp/LM Studio backends). Optional: /kvc <focus instructions>",
+      "KV-cache-compatible compaction (like /compact, but the summary request reuses the server's KV cache - no full re-prefill on llama.cpp/LM Studio backends). Optional: /kvc <focus instructions>; /kvc force skips the model-id check",
     handler: async (args, ctx) => {
-      const instructions = (args ?? "").trim() || undefined;
-      dbg(`/kvc invoked args=${JSON.stringify(args ?? "")} captured=${Boolean(captured)} capturedModel=${captured?.modelId ?? "-"} ctxModel=${ctx.model ? `${ctx.model.provider}/${ctx.model.id} api=${ctx.model.api}` : "-"}`);
+      let instructions = (args ?? "").trim();
+      let force = false;
+      const forceMatch = instructions.match(/^--?force\b/i);
+      if (forceMatch) {
+        force = true;
+        instructions = instructions.slice(forceMatch[0].length).trim();
+      }
+      const focus = instructions || undefined;
+      dbg(`/kvc invoked force=${force} args=${JSON.stringify(args ?? "")} captured=${Boolean(captured)} capturedModel=${captured?.modelId ?? "-"} ctxModel=${ctx.model ? `${ctx.model.provider}/${ctx.model.id} api=${ctx.model.api}` : "-"}`);
       if (!captured) {
         ctx.ui.notify("kvc: no request cached yet - run at least one agent turn first, then /kvc (or use /compact)", "warning");
         return;
@@ -484,8 +516,8 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(`kvc: ${ctx.model.provider} is not OpenAI-compatible - use /compact`, "warning");
         return;
       }
-      if (captured.modelId !== ctx.model.id) {
-        ctx.ui.notify("kvc: model changed since the last request - use /compact (or run one more turn first)", "warning");
+      if (!modelIdMatches(captured.modelId, ctx.model.id, String(ctx.model.provider)) && !force) {
+        ctx.ui.notify(`kvc: model mismatch (captured="${captured.modelId}" current="${ctx.model.id}") - run one turn with the current model first, or /kvc force, or /compact`, "warning");
         return;
       }
       try {
@@ -498,8 +530,9 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       compatArmedUntil = Date.now() + ARMS_TTL_MS;
+      compatForce = force;
       ctx.compact({
-        customInstructions: instructions,
+        customInstructions: focus,
         onComplete: (result) => {
           ctx.ui.notify(`kvc done: ${result.tokensBefore} -> ~${result.estimatedTokensAfter ?? "?"} context tokens`, "info");
         },

@@ -93,12 +93,18 @@ Then in pi:
 - `/kvc` — compact (same semantics as `/compact`)
 - `/kvc <focus>` — compact with extra instructions, e.g.
   `/kvc keep the last failing test`
+- `/kvc force` — skip the captured/current model-id check (see below). Can be
+  combined: `/kvc force keep the test output`
 
 Notes:
 
 - Run one normal turn first; until then the extension has nothing to
   capture and will tell you to use `/compact`.
 - Switching models invalidates the capture (run another turn, then `/kvc`).
+- `model mismatch` — the model id recorded in the captured request differs
+  from the current model id. If the mismatch is only cosmetic (e.g. a pi
+  version formats the id differently), `/kvc force` proceeds anyway — the
+  summary is still correct, only the prefix-cache benefit may be lost.
 - The summary generation itself is as slow as a normal completion of the
   same length on your local model — `/kvc` only removes the re-prefill.
 - Diagnostics (counts and timing only, no message content) are appended to
@@ -107,8 +113,10 @@ Notes:
 ## Troubleshooting
 
 - `kvc: no request cached yet` — run one agent turn, then `/kvc`.
-- `kvc: model changed since the last request` — run one turn with the new
-  model, then `/kvc`.
+- `kvc: model mismatch (captured="X" current="Y")` — the two ids are shown
+  in the message. If X and Y are the same model in different formats, use
+  `/kvc force`. If they are genuinely different models, run one turn with
+  the current model, then `/kvc`.
 - `kvc: ... falling back to built-in compaction` — the fallback ran the
   normal `/compact` flow; check `kvc-debug.log` in your temp dir for the
   recorded error.
