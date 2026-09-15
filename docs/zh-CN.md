@@ -32,6 +32,24 @@ prompt 前缀与之前任何请求都不匹配 → llama.cpp/LM Studio 后端必
 前提:当前 session 至少完成过一个 agent turn(需要已捕获的请求作为前缀);
 模型/provider 变更、请求失败等情况会自动回退到内建 /compact 逻辑。
 
+## 自动压缩(预设开启)
+
+长 session 不用记得打 `/kvc`:上下文用到**视窗 85%** 时,扩充套件自动 arm 并走同一条
+KV-cache-compatible 压缩路径。实现对照 pi 内建 auto-compact:
+每次 agent run 完全 settled 后,用 pi 自己的 `getContextUsage()`
+(与 footer 显示的百分比相同)检查;开启时也接管 pi 内建的 threshold/overflow
+自动压缩,小视窗下同样走 KV-cache 路径。回退规则与 `/kvc` 相同;
+手动 `/compact` 始終保持内建行为。
+
+开关在 `~/.pi/agent/settings.json`(全局)或 `<project>/.pi/settings.json`
+(专案优先),**预设开启**:
+
+```json
+{ "kvc": { "autoCompact": false } }
+```
+
+触发决定(`TRIGGER` / `SKIP` 及原因)记录在临时目录的 `kvc-debug.log`。
+
 ## 后端要求(已实测通过:LM Studio + llama.cpp/Vulkan)
 
 服务器必须支持跨请求的 KV 前缀重用:
@@ -51,6 +69,10 @@ prompt 前缀与之前任何请求都不匹配 → llama.cpp/LM Studio 后端必
   hook 内用 captured payload + 追加指令直接请求 `<baseUrl>/chat/completions`
   (`stream:false`),返回自定义 `compaction` 条目(含 pi 同款
   `<read-files>/<modified-files>` 文件追踪)。
+- `agent_settled`(每次 agent run 完全 settled):读 `kvc.autoCompact`
+  (预设 true)→ ≥85% 且前置条件与 `/kvc` 相同 → arm 后呼叫同一个
+  `ctx.compact()`,回退逻辑完全共用;
+  `session_before_compact` 在开启时也接管 threshold/overflow 自动压缩。
 - 与 pi-cache-guardian 兼容:golden prompt 改写、`prompt_cache_key` 注入均不影响
   (capture 到的是实际发出的 payload)。
 

@@ -63,8 +63,30 @@ llama.cpp(含 LM Studio 後端)的 KV 快取規則:**跨請求重用「共同前
 | `/kvc` | 壓縮(行為等同 `/compact`,但走 KV 快取) |
 | `/kvc <重點提示>` | 帶重點,例如 `/kvc 保留最近測試失敗的訊息` |
 
-前提:目前 session 至少要完成過**一個 agent turn**(需要已捕獲的請求作為前綴)。
+前提:目前 session 至少要完成過**一個 agent turn**(需要已捕獲的請求作為字首)。
 新 session 直接 `/kvc` 會提示改用 `/compact`。
+
+### 自動壓縮(85% 觸發,預設開啟)
+
+長 session 不必記得打 `/kvc`:當上下文用到**視窗的 85%** 時,
+擴充套件自動 arm 並走同一條 KV-cache-compatible 壓縮路徑——不會全量重填。
+實作完全對照 pi 內建 auto-compact 的設計:
+
+- **檢查時機**:每次 agent run 完全 settled(重試、排隊訊息都處理完)之後,
+  用 pi 自己的計數(`getContextUsage()`,與 footer 顯示的百分比相同)判斷。
+- **也接管 pi 內建的 threshold/overflow 自動壓縮**:小視窗下
+  (`contextWindow - reserveTokens` 比 85% 更早觸發),自動壓縮同樣走 KV-cache 路徑。
+- **回退規則與 `/kvc` 完全相同**:無捕獲、模型變更、非 OpenAI 相容 provider →
+  改跑內建壓縮;手動 `/compact` 永遠保持內建行為(要快就用 `/kvc`)。
+
+開關設定在 `~/.pi/agent/settings.json`(全域)或 `<project>/.pi/settings.json`
+(專案優先),**預設開啟**:
+
+```json
+{ "kvc": { "autoCompact": false } }
+```
+
+自動觸發的決定(`TRIGGER` / `SKIP` 及原因)會記錄在暫存目錄的 `kvc-debug.log`。
 
 ## 五、安全與回退設計
 
@@ -120,7 +142,8 @@ pi-cache-guardian 會逐 turn 改寫 system prompt(golden prompt 最佳化),
   - `-fa 1`:flash attention(Vulkan 可用)
   - `-ctk q8_0 -ctv q8_0`:KV 量化,省 VRAM、可留更大 context
   - `-c`:context 開夠大;`-ngl`:盡可能上 GPU
-- 不需要改任何 pi settings。
+- 唯一新增的設定是 kvc 自己的開關 `kvc.autoCompact`(預設 true,見上一節),
+  pi 內建的 compaction settings 不用動。
 
 ## 七、實測數據(LM Studio,ornith-1.5-35b-a3b,41k tokens 上下文)
 
@@ -140,7 +163,12 @@ pi-cache-guardian 會逐 turn 改寫 system prompt(golden prompt 最佳化),
   模型切換時作廢捕獲)。
 - `registerCommand("kvc")`:檢查前置條件 → 設定 armed 標誌 →
   `ctx.compact({ customInstructions, onComplete, onError })`。
-- `session_before_compact`:若 flag 有效且是 manual 觸發 →
+- `agent_settled`(每次 agent run 完全 settled):讀 `kvc.autoCompact`
+  (預設 true)→ 用 pi 自己的 `getContextUsage()` 算出百分比,
+  ≥85% 且前置條件與 `/kvc` 相同(有捕獲、OpenAI 相容、模型一致,不用 force)
+  → arm 後呼叫同一個 `ctx.compact()`,所以回退邏輯完全共用。
+- `session_before_compact`:若 flag 有效(manual 觸發),**或**這是自動壓縮
+  (threshold/overflow)且 `kvc.autoCompact` 開啟 →
   以「捕獲 payload + 追加指令」直接呼叫 `<baseUrl>/chat/completions`
   (`stream:false`;一次瞬時錯誤重試;模型若誤用 tools 則無 tools 重試一次)
   → 回傳自訂 `compaction`(摘要 + `firstKeptEntryId` + `tokensBefore` +
