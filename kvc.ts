@@ -330,8 +330,10 @@ async function runCompatSummary(base: CapturedRequest, model: any, ctx: Extensio
     throw new Error("captured payload is invalid");
   }
   const sysMsg = base.payload.messages[0];
-  if (!sysMsg || sysMsg.role !== "system" || typeof sysMsg.content !== "string") {
-    throw new Error("captured payload has no system message");
+  // Some models (e.g. qwen3.x via LM Studio) carry the system prompt in
+  // OpenAI's newer "developer" role - treat both as the system prompt.
+  if (!sysMsg || (sysMsg.role !== "system" && sysMsg.role !== "developer") || typeof sysMsg.content !== "string") {
+    throw new Error("captured payload has no system/developer message");
   }
   // NOTE: deliberately NOT comparing the captured system prompt against
   // ctx.getSystemPrompt(). Extensions such as pi-cache-guardian rewrite the
@@ -436,8 +438,11 @@ export default function (pi: ExtensionAPI) {
       dbg(`before_provider_request SKIP shape model=${typeof p.model} messages=${p && typeof p === "object" ? String(p.messages?.length ?? typeof p.messages) : "n/a"}`);
       return;
     }
+    // Accept both "system" and OpenAI's newer "developer" role (used by e.g.
+    // qwen3.x on LM Studio) as the system prompt - otherwise every request
+    // from those models would be skipped and nothing would ever be captured.
     const sys = p.messages[0];
-    if (!sys || typeof sys !== "object" || sys.role !== "system" || typeof sys.content !== "string") {
+    if (!sys || typeof sys !== "object" || (sys.role !== "system" && sys.role !== "developer") || typeof sys.content !== "string") {
       dbg(`before_provider_request SKIP m0 role=${sys?.role} content-type=${typeof sys?.content}`);
       return;
     }
