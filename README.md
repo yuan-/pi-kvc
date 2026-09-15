@@ -37,8 +37,16 @@ context size). `/kvc` avoids that:
    verbatim leading copy if the model repeats it anyway).
 5. On any failure (no capture yet, model changed, non-OpenAI provider,
    request error) `/kvc` automatically falls back to the built-in
-   compaction. The built-in `/compact` and auto-compaction are never
-   touched.
+   compaction.
+6. **Auto-compaction (on by default)**: after every agent run has fully
+   settled — pi's own checkpoint for its built-in auto-compact — the context
+   usage is checked with pi's own accounting (`getContextUsage()`, the same
+   number shown in the footer). At **85% of the model window** a kvc
+   compaction is armed and runs through the exact same path as `/kvc`.
+   While enabled, automatic (threshold/overflow) compactions are also taken
+   over, so on small windows where pi's `contextWindow - reserveTokens`
+   threshold fires before 85%, they still use the KV-cache path. Manual
+   `/compact` always stays built-in.
 
 The summary format matches pi's built-in one (`## Goal` / `### Done` /
 `### In Progress` / ...), including `<read-files>` / `<modified-files>`
@@ -95,6 +103,34 @@ Then in pi:
   `/kvc keep the last failing test`
 - `/kvc force` — skip the captured/current model-id check (see below). Can be
   combined: `/kvc force keep the test output`
+
+## Auto-compaction (on by default)
+
+So you don't have to remember `/kvc` on long local-model sessions: when the
+context reaches **85% of the window**, kvc arms itself and runs the same
+KV-cache-compatible compaction automatically — no full re-prefill.
+
+It mirrors pi's own auto-compact design:
+
+- checked after every agent run has fully settled (retries and queued
+  continuations drained), using pi's own context accounting — the same
+  percentage shown in the footer
+- also takes over pi's built-in threshold/overflow auto-compactions, so even
+  on small windows (where `contextWindow - reserveTokens` fires before 85%)
+  automatic compactions go through the KV-cache path
+- all `/kvc` fallbacks apply: no capture yet / model changed / non-OpenAI
+  provider → built-in compaction runs instead; manual `/compact` always stays
+  on the built-in path (use `/kvc` for the fast one)
+
+Toggle in `~/.pi/agent/settings.json` or `<project>/.pi/settings.json`
+(project wins), default is **on**:
+
+```json
+{ "kvc": { "autoCompact": false } }
+```
+
+Auto-trigger decisions (`TRIGGER` / `SKIP` with the reason) are logged to
+`kvc-debug.log` in your temp directory.
 
 Notes:
 

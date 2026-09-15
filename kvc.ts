@@ -31,11 +31,25 @@
  * also strips a verbatim leading copy of the system prompt if the model
  * repeats it anyway.
  *
+ * Auto-compaction (default ON)
+ * ----------------------------
+ * Mirrors pi's own auto-compact design: after every agent run has fully
+ * settled, the context usage is checked with pi's own accounting
+ * (ctx.getContextUsage() - the same numbers shown in the footer) and a kvc
+ * compaction is armed once it reaches 85% of the model window. It also takes
+ * over pi's built-in threshold/overflow auto-compactions, so on small windows
+ * (where pi's `contextWindow - reserveTokens` fires before 85%) automatic
+ * compactions still go through the KV-cache path.
+ *
+ * Toggle: { "kvc": { "autoCompact": false } } in <project>/.pi/settings.json
+ * or ~/.pi/agent/settings.json. Default is true (on).
+ *
  * Safety
  * ------
- * /kvc only takes over a compaction triggered by /kvc itself (armed flag with
- * a 2-minute expiry). The built-in /compact and auto-compaction are untouched.
- * /kvc falls back to the built-in compaction automatically when:
+ * /kvc only takes over a compaction triggered by /kvc itself, or an automatic
+ * compaction while kvc.autoCompact is on (armed flag with a 2-minute expiry).
+ * The manual built-in /compact is untouched. Everything falls back to the
+ * built-in compaction automatically when:
  *   - no OpenAI-shaped request was captured yet (fresh session),
  *   - the model or system prompt changed since the capture,
  *   - the provider is not OpenAI-compatible,
@@ -57,6 +71,7 @@ function dbg(msg: string) {
   }
 }
 import type {
+  AgentSettledEvent,
   ExtensionAPI,
   ExtensionContext,
   ModelSelectEvent,
@@ -85,6 +100,13 @@ let compatForce = false;
 dbg(`module loaded (pid=${process.pid})`);
 
 const SUMMARIZER_SYSTEM_PREFIX = "You are a context summarization assistant";
+/**
+ * Auto-compaction trigger point: percentage of the model's context window.
+ * Mirrors pi's own auto-compact formula (contextTokens > contextWindow -
+ * reserveTokens) with an implicit reserve of 15% of the window. Checked after
+ * every settled agent run, using pi's own context accounting.
+ */
+const AUTO_COMPACT_THRESHOLD_PERCENT = 85;
 const ARMS_TTL_MS = 2 * 60 * 1000; // compaction starts within milliseconds
 // Local 27B-class models can generate a 10k+ token summary at only ~5 tok/s;
 // 30 min proved too short in practice (observed: request aborted at 30 min,
@@ -145,6 +167,21 @@ function buildInstruction(opts: { hasPreviousSummary: boolean; customInstruction
     lines.push(`Additional focus: ${opts.customInstructions}`);
   }
   return lines.join("\n");
+}
+
+/** Read kvc.autoCompact from project settings, then global settings. Default: on. */
+function readAutoCompactEnabled(cwd: string): boolean {
+  const candidates = [join(cwd, ".pi", "settings.json"), join(homedir(), ".pi", "agent", "settings.json")];
+  for (const p of candidates) {
+    try {
+      const s = JSON.parse(readFileSync(p, "utf8"));
+      const v = s?.kvc?.autoCompact;
+      if (typeof v === "boolean") return v;
+    } catch {
+      /* missing/invalid file - try next */
+    }
+  }
+  return true; // default on
 }
 
 /** Read compaction.reserveTokens from project settings, then global settings. */
@@ -425,21 +462,25 @@ export default function (pi: ExtensionAPI) {
     dbg(`session_start reason=${e?.reason} (clear captured/armed)`);
     captured = null;
     compatArmedUntil = 0;
+    compatForce = false;
   });
   pi.on("session_shutdown", (e: any) => {
     dbg(`session_shutdown reason=${e?.reason}`);
     captured = null;
     compatArmedUntil = 0;
+    compatForce = false;
   });
 
-  // 3) Take over only /kvc-triggered compactions.
+  // 3) Take over compactions triggered by /kvc, plus automatic ones while
+  //    kvc.autoCompact is on. A plain manual /compact always stays built-in.
   pi.on("session_before_compact", async (event, ctx) => {
-    dbg(`session_before_compact reason=${event.reason} armed=${Date.now() <= compatArmedUntil} captured=${Boolean(captured)} force=${compatForce}`);
-    if (Date.now() > compatArmedUntil) return; // not armed: built-in /compact or auto-compaction -> untouched
+    const armed = Date.now() <= compatArmedUntil;
+    const autoTakeover = event.reason !== "manual" && readAutoCompactEnabled(ctx.cwd);
+    dbg(`session_before_compact reason=${event.reason} armed=${armed} autoTakeover=${autoTakeover} captured=${Boolean(captured)} force=${compatForce}`);
+    if (!armed && !autoTakeover) return; // not ours: manual /compact, or auto-compaction with kvc.autoCompact off -> untouched
     compatArmedUntil = 0;
     const force = compatForce;
     compatForce = false;
-    if (event.reason !== "manual") return;
 
     const notify = (msg: string, kind: "info" | "warning" | "error" = "info") => {
       try {
@@ -542,5 +583,89 @@ export default function (pi: ExtensionAPI) {
         },
       });
     },
+  });
+
+  // 5) Auto-compaction at AUTO_COMPACT_THRESHOLD_PERCENT of the context window.
+  //    Mirrors pi's own auto-compact checkpoints: checked after every agent run
+  //    has fully settled (retries and queued continuations drained), using pi's
+  //    own context accounting. The trigger only ARMS a compaction via the same
+  //    ctx.compact() path as /kvc, so all fallbacks apply unchanged.
+  function maybeAutoCompact(ctx: ExtensionContext): void {
+    try {
+      if (!readAutoCompactEnabled(ctx.cwd)) return;
+      if (Date.now() <= compatArmedUntil) return; // compaction pending/running; the armed TTL also cools down after failures
+
+      const model = ctx.model;
+      if (!model || typeof model.contextWindow !== "number" || model.contextWindow <= 0) return;
+
+      let percent: number | null = null;
+      try {
+        // pi's own accounting (last assistant usage / estimate), same as the footer display.
+        const usage = ctx.getContextUsage();
+        if (usage && typeof usage.percent === "number") percent = usage.percent;
+      } catch {
+        /* unknown - skip */
+      }
+      if (percent == null || !Number.isFinite(percent)) return; // context size unknown until the next LLM response
+
+      if (percent < AUTO_COMPACT_THRESHOLD_PERCENT) {
+        dbg(`auto-compact check: ${percent.toFixed(1)}% < ${AUTO_COMPACT_THRESHOLD_PERCENT}% -> skip`);
+        return;
+      }
+
+      // Same preconditions as /kvc (without force): on mismatch, fall through to pi's own compaction.
+      if (!captured) {
+        dbg(`auto-compact SKIP: context at ${percent.toFixed(1)}% but no captured request`);
+        return;
+      }
+      if (model.api !== "openai-completions") {
+        dbg(`auto-compact SKIP: api=${model.api} is not OpenAI-compatible`);
+        return;
+      }
+      if (!modelIdMatches(captured.modelId, model.id, String(model.provider))) {
+        dbg(`auto-compact SKIP: model mismatch (captured="${captured.modelId}" current="${model.id}")`);
+        return;
+      }
+
+      compatArmedUntil = Date.now() + ARMS_TTL_MS;
+      compatForce = false;
+      const pct = Math.round(percent);
+      dbg(`auto-compact TRIGGER at ${pct}% of ${model.contextWindow} tokens (threshold=${AUTO_COMPACT_THRESHOLD_PERCENT}%)`);
+
+      try {
+        if (ctx.hasUI) ctx.ui.notify(`kvc: context at ${pct}% of window - auto-compacting via KV cache`, "info");
+        else console.log(`[kvc] context at ${pct}% of window - auto-compacting`);
+      } catch {
+        /* non-fatal */
+      }
+
+      ctx.compact({
+        onComplete: (result) => {
+          try {
+            const msg = `kvc auto-compact done: ${result.tokensBefore} -> ~${result.estimatedTokensAfter ?? "?"} context tokens`;
+            if (ctx.hasUI) ctx.ui.notify(msg, "info");
+            else console.log(`[kvc] ${msg}`);
+          } catch {
+            /* non-fatal */
+          }
+        },
+        onError: (err) => {
+          compatArmedUntil = 0; // allow a retry on the next settled run
+          try {
+            if (ctx.hasUI) ctx.ui.notify(`kvc auto-compact failed: ${err.message}`, "error");
+            else console.error(`[kvc] auto-compact failed: ${err.message}`);
+          } catch {
+            /* non-fatal */
+          }
+        },
+      });
+    } catch (err: any) {
+      // e.g. ctx went stale during a session replacement while this ran
+      dbg(`auto-compact check error: ${String(err?.message ?? err)}`);
+    }
+  }
+
+  pi.on("agent_settled", (_event: AgentSettledEvent, ctx) => {
+    void maybeAutoCompact(ctx); // do not block the settle/idle path on compaction
   });
 }
